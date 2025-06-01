@@ -1,11 +1,10 @@
 require("dotenv").config();
-const { Telegraf } = require("telegraf");
+const { Telegraf, Markup } = require("telegraf");
 const fetch = require("node-fetch");
 const fs = require("fs");
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-// Функция логирования
 function log(message) {
   const timestamp = new Date().toISOString();
   fs.appendFileSync("bot.log", `[${timestamp}] ${message}\n`);
@@ -13,32 +12,58 @@ function log(message) {
 
 bot.start((ctx) => {
   ctx.reply(
-    "Привет! Я бот для получения погоды и цены закрытия акций по тикеру компании.\nНапиши команду /help чтобы узнать как пользоваться ботом."
+    "Привет! Выберите, что хотите узнать:",
+    Markup.inlineKeyboard([
+      [
+        Markup.button.callback("Погода", "ask_weather"),
+        Markup.button.callback("Акции", "ask_stock"),
+      ],
+    ])
   );
+  bot.context.mode = null;
   log(`START: ${ctx.from.username || ctx.from.first_name}`);
 });
 
 bot.help((ctx) => {
   ctx.reply(
-    "Главные команды:\n/start - Начать взаимодействие с ботом\n/help - Получить список доступных команд\n/weather <city> - Получить текущую погоду по определённому городу, например: /weather Kiev\n/stock <ticker> - Получить цену закрытия акций по тикеру компании, например: /stock AAPL"
+    "Главные команды:\n/start - Начать\n/help - Помощь\n/weather <город>\n/stock <тикер>"
   );
   log(`HELP: ${ctx.from.username || ctx.from.first_name}`);
 });
 
-// Команда погоды
-bot.command("weather", async (ctx) => {
-  const parts = ctx.message.text.split(" ");
-  const city = parts[1];
+// Обработка кнопки Погода
+bot.action("ask_weather", (ctx) => {
+  ctx.reply("Введите название города, чтобы узнать погоду.");
+  bot.context.mode = { type: "weather", userId: ctx.from.id };
+});
+
+// Обработка кнопки Акции
+bot.action("ask_stock", (ctx) => {
+  ctx.reply("Введите название компании или тикер, чтобы узнать цену акций.");
+  bot.context.mode = { type: "stock", userId: ctx.from.id };
+});
+
+bot.on("text", async (ctx) => {
+  const userId = ctx.from.id;
+  const userInput = ctx.message.text.trim();
   const user = ctx.from.username || ctx.from.first_name;
 
-  if (!city) {
-    ctx.reply(
-      "Вы неверно ввели команду для полуения погоды введите /weather <название города>."
-    );
-    log(`WEATHER: ${user} — Город не указан`);
+  const mode = bot.context.mode;
+  if (!mode || mode.userId !== userId) {
+    ctx.reply('Пожалуйста, нажмите кнопку "Погода" или "Акции", чтобы начать.');
     return;
   }
 
+  if (mode.type === "weather") {
+    return getWeather(ctx, userInput, user);
+  }
+
+  if (mode.type === "stock") {
+    return getStock(ctx, userInput, user);
+  }
+});
+
+async function getWeather(ctx, city, user) {
   try {
     const response = await fetch(
       `http://api.weatherapi.com/v1/current.json?key=${process.env.WEATHER_API_KEY}&q=${city}`
@@ -51,63 +76,49 @@ bot.command("weather", async (ctx) => {
       const temp = data.current.temp_c;
       const message =
         temp < 15
-          ? `Сегодня температура ${temp} градусов, холодно, одень куртку`
-          : `Сегодня ${temp} градусов, отличный день, можно бегать в футболке`;
+          ? `Сегодня температура ${temp}°C, холодно, одень куртку.`
+          : `Сегодня ${temp}°C, отличный день, можно бегать в футболке.`;
       ctx.reply(message);
       log(`WEATHER: ${user} — ${city}: ${temp}°C`);
     }
   } catch (error) {
-    ctx.reply(
-      "Не удалось получить данные о погоде. Пожалуйста, попробуйте позже или проверьту правильность написания команды."
-    );
+    ctx.reply("Ошибка при получении данных о погоде. Попробуйте позже.");
     log(`WEATHER: ${user} — Ошибка при fetch`);
   }
-});
+}
 
-// Команда акций
-bot.command("stock", async (ctx) => {
-  const parts = ctx.message.text.split(" ");
-  const ticker = parts[1];
-  const user = ctx.from.username || ctx.from.first_name;
-
-  if (!ticker) {
-    ctx.reply(
-      "Вы неверно ввели команду для полуения цены закрытия акций введите /stock <тикер компании>."
-    );
-    log(`STOCK: ${user} — Тикер не указан`);
-    return;
-  }
-
+async function getStock(ctx, input, user) {
   try {
-    const response = await fetch(
-      `https://data.nasdaq.com/api/v3/datatables/QUOTEMEDIA/PRICES?ticker=${ticker}&api_key=${process.env.NASDAQ_API_KEY}`
+    const guessTicker = input.toUpperCase();
+    let response = await fetch(
+      `https://data.nasdaq.com/api/v3/datatables/QUOTEMEDIA/PRICES?ticker=${guessTicker}&api_key=${process.env.NASDAQ_API_KEY}`
     );
-    const data = await response.json();
-    const rows = data.datatable.data;
-    if (rows.length === 0) {
+    let data = await response.json();
+
+    if (!data.datatable || data.datatable.data.length === 0) {
       ctx.reply(
-        "Данные не найдены для указанного тикера. Пожалуйста, проверьте правильность написания тикера или по данному тикеру может не быть данных."
+        "Не найден тикер. Попробуйте точный тикер, например AAPL или MSFT."
       );
-      log(`STOCK: ${user} — Нет данных для тикера ${ticker}`);
+      log(`STOCK: ${user} — Не найден тикер ${input}`);
       return;
     }
-    const latest = rows[0];
+
+    const latest = data.datatable.data[0];
     const date = latest[1];
     const closePrice = latest[5];
-    ctx.reply(`Дата: ${date}\nЦена закрытия акций ${ticker}: $${closePrice}`);
-    log(`STOCK: ${user} — ${ticker}: $${closePrice}`);
-  } catch (error) {
     ctx.reply(
-      "Произошла ошибка при получении данных о ценах акций. Пожалуйста, попробуйте позже или проверьте правильность написания тикера."
+      `Дата: ${date}\nЦена закрытия акций ${guessTicker}: $${closePrice}`
     );
+    log(`STOCK: ${user} — ${guessTicker}: $${closePrice}`);
+  } catch (error) {
+    ctx.reply("Ошибка при получении данных об акциях. Попробуйте позже.");
     log(`STOCK: ${user} — Ошибка при fetch`);
   }
-});
+}
 
 bot.launch();
 log("Бот запущен");
 
-// Остановка
 process.once("SIGINT", () => {
   log("Остановка бота (SIGINT)");
   bot.stop("SIGINT");
